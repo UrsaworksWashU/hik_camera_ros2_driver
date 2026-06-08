@@ -72,6 +72,11 @@ private:
       return false;
     }
 
+    // Apply the requested capture resolution (ROI) before querying image info,
+    // so the buffers below are sized for the actual frame. Must run before
+    // StartGrabbing, since Width/Height are locked while grabbing.
+    setResolution();
+
     // Get camera information
     n_ret_ = MV_CC_GetImageInfo(camera_handle_, &img_info_);
     if (n_ret_ != MV_OK) {
@@ -86,6 +91,101 @@ private:
     convert_param_.enDstPixelType = PixelType_Gvsp_RGB8_Packed;
 
     return true;
+  }
+
+  // Clamp v into [nMin, nMax] and snap it down to the device's increment grid
+  // for an integer GenICam feature. Width/Height/Offset all advance in steps of
+  // nInc; setting an off-grid value is rejected by the SDK.
+  static unsigned int clampToInc(const MVCC_INTVALUE & info, int v)
+  {
+    if (v < static_cast<int>(info.nMin)) {
+      v = static_cast<int>(info.nMin);
+    }
+    if (v > static_cast<int>(info.nMax)) {
+      v = static_cast<int>(info.nMax);
+    }
+    unsigned int uv = static_cast<unsigned int>(v);
+    if (info.nInc > 1) {
+      uv = info.nMin + ((uv - info.nMin) / info.nInc) * info.nInc;
+    }
+    return uv;
+  }
+
+  // Set an integer feature (e.g. "Width"/"Height") to the requested value,
+  // snapped to its valid range/increment. No-op for non-positive requests.
+  void applyDimension(const char * key, int desired)
+  {
+    if (desired <= 0) {
+      return;
+    }
+    MVCC_INTVALUE info;
+    if (MV_CC_GetIntValue(camera_handle_, key, &info) != MV_OK) {
+      RCLCPP_WARN(this->get_logger(), "Failed to read %s; leaving unchanged", key);
+      return;
+    }
+    unsigned int value = clampToInc(info, desired);
+    int status = MV_CC_SetIntValue(camera_handle_, key, value);
+    if (status == MV_OK) {
+      RCLCPP_INFO(
+        this->get_logger(), "%s set to %u (requested %d, range [%u, %u] inc %u)",
+        key, value, desired, info.nMin, info.nMax, info.nInc);
+    } else {
+      RCLCPP_ERROR(this->get_logger(), "Failed to set %s to %u, status = %d", key, value, status);
+    }
+  }
+
+  // Center the ROI on the sensor: offset = (sensorMax - currentSize) / 2,
+  // snapped to the offset increment.
+  void centerOffset(const char * offset_key, const char * size_key, const char * max_key)
+  {
+    MVCC_INTVALUE size_info, max_info, offset_info;
+    if (MV_CC_GetIntValue(camera_handle_, size_key, &size_info) != MV_OK ||
+      MV_CC_GetIntValue(camera_handle_, max_key, &max_info) != MV_OK ||
+      MV_CC_GetIntValue(camera_handle_, offset_key, &offset_info) != MV_OK)
+    {
+      RCLCPP_WARN(this->get_logger(), "Failed to read geometry for %s; leaving at 0", offset_key);
+      return;
+    }
+    int target =
+      (static_cast<int>(max_info.nCurValue) - static_cast<int>(size_info.nCurValue)) / 2;
+    unsigned int value = clampToInc(offset_info, target);
+    if (MV_CC_SetIntValue(camera_handle_, offset_key, value) == MV_OK) {
+      RCLCPP_INFO(this->get_logger(), "%s set to %u (centered)", offset_key, value);
+    }
+  }
+
+  // Force the capture resolution from parameters so it tracks the config rather
+  // than whatever is persisted on the camera. Applied as a centered ROI; either
+  // dimension left at 0 keeps the camera's current value for that axis.
+  void setResolution()
+  {
+    rcl_interfaces::msg::ParameterDescriptor desc;
+    desc.description = "Capture width in px (0 = leave at camera default). Applied as centered ROI.";
+    int image_width = this->declare_parameter("image_width", 0, desc);
+    desc.description =
+      "Capture height in px (0 = leave at camera default). Applied as centered ROI.";
+    int image_height = this->declare_parameter("image_height", 0, desc);
+
+    if (image_width <= 0 && image_height <= 0) {
+      RCLCPP_INFO(
+        this->get_logger(), "image_width/image_height not set; using camera's current resolution");
+      return;
+    }
+
+    // Zero the offsets first so shrinking Width/Height cannot transiently
+    // violate the Width+OffsetX <= WidthMax / Height+OffsetY <= HeightMax rule.
+    MV_CC_SetIntValue(camera_handle_, "OffsetX", 0);
+    MV_CC_SetIntValue(camera_handle_, "OffsetY", 0);
+
+    applyDimension("Width", image_width);
+    applyDimension("Height", image_height);
+
+    if (image_width > 0) {
+      centerOffset("OffsetX", "Width", "WidthMax");
+    }
+    if (image_height > 0) {
+      centerOffset("OffsetY", "Height", "HeightMax");
+    }
   }
 
   void declareParameters()
