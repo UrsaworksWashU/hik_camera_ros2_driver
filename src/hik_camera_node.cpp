@@ -1,3 +1,4 @@
+#include <cstring>
 #include <string>
 
 #include "MvCameraControl.h"
@@ -145,6 +146,38 @@ private:
     } else {
       RCLCPP_ERROR(this->get_logger(), "Failed to set Pixel Format, status = %d", status);
     }
+
+    // Decide how the frame is published. For Bayer formats we publish the raw
+    // single-channel mosaic and let consumers (e.g. cv_bridge in the detector)
+    // debayer it. This skips the per-frame CPU debayer here and cuts the
+    // published payload ~3x (e.g. 6MB rgb8 -> 2MB bayer), raising the achievable
+    // frame rate. Non-Bayer formats keep the original convert-to-rgb8 path.
+    std::string bayer_encoding = rosBayerEncoding(pixel_format);
+    if (!bayer_encoding.empty()) {
+      publish_raw_ = true;
+      image_encoding_ = bayer_encoding;
+      RCLCPP_INFO(
+        this->get_logger(), "Publishing raw %s as '%s' (debayer deferred to consumers)",
+        pixel_format.c_str(), image_encoding_.c_str());
+    } else {
+      publish_raw_ = false;
+      image_encoding_ = "rgb8";
+      RCLCPP_INFO(
+        this->get_logger(), "Publishing rgb8 (debayering %s on camera node)", pixel_format.c_str());
+    }
+  }
+
+  // Map a HIK/GenICam 8-bit Bayer pixel format to the matching ROS image
+  // encoding. Returns "" if the format is not a raw Bayer format we pass
+  // through. Note GenICam names the CFA by the first two pixels of the first
+  // row, which corresponds directly to the ROS bayer_*8 encodings.
+  static std::string rosBayerEncoding(const std::string & pixel_format)
+  {
+    if (pixel_format == "BayerRG8") return "bayer_rggb8";
+    if (pixel_format == "BayerGB8") return "bayer_gbrg8";
+    if (pixel_format == "BayerGR8") return "bayer_grbg8";
+    if (pixel_format == "BayerBG8") return "bayer_bggr8";
+    return "";
   }
 
   void startCamera()
@@ -178,24 +211,32 @@ private:
     RCLCPP_INFO(this->get_logger(), "Publishing image!");
 
     image_msg_.header.frame_id = frame_id_;
-    image_msg_.encoding = "rgb8";
+    image_msg_.encoding = image_encoding_;
 
     while (rclcpp::ok()) {
       n_ret_ = MV_CC_GetImageBuffer(camera_handle_, &out_frame, 1000);
       if (MV_OK == n_ret_) {
-        convert_param_.pDstBuffer = image_msg_.data.data();
-        convert_param_.nDstBufferSize = image_msg_.data.size();
-        convert_param_.pSrcData = out_frame.pBufAddr;
-        convert_param_.nSrcDataLen = out_frame.stFrameInfo.nFrameLen;
-        convert_param_.enSrcPixelType = out_frame.stFrameInfo.enPixelType;
-
-        MV_CC_ConvertPixelType(camera_handle_, &convert_param_);
-
         image_msg_.header.stamp = this->now();
         image_msg_.height = out_frame.stFrameInfo.nHeight;
         image_msg_.width = out_frame.stFrameInfo.nWidth;
-        image_msg_.step = out_frame.stFrameInfo.nWidth * 3;
-        image_msg_.data.resize(image_msg_.width * image_msg_.height * 3);
+
+        if (publish_raw_) {
+          // Copy the raw single-channel Bayer mosaic straight through.
+          image_msg_.step = out_frame.stFrameInfo.nWidth;
+          image_msg_.data.resize(out_frame.stFrameInfo.nFrameLen);
+          std::memcpy(
+            image_msg_.data.data(), out_frame.pBufAddr, out_frame.stFrameInfo.nFrameLen);
+        } else {
+          // Debayer/convert to rgb8 on the camera node.
+          image_msg_.step = out_frame.stFrameInfo.nWidth * 3;
+          image_msg_.data.resize(image_msg_.width * image_msg_.height * 3);
+          convert_param_.pDstBuffer = image_msg_.data.data();
+          convert_param_.nDstBufferSize = image_msg_.data.size();
+          convert_param_.pSrcData = out_frame.pBufAddr;
+          convert_param_.nSrcDataLen = out_frame.stFrameInfo.nFrameLen;
+          convert_param_.enSrcPixelType = out_frame.stFrameInfo.enPixelType;
+          MV_CC_ConvertPixelType(camera_handle_, &convert_param_);
+        }
 
         camera_info_msg_.header = image_msg_.header;
         camera_pub_.publish(image_msg_, camera_info_msg_);
@@ -274,6 +315,8 @@ private:
 
   sensor_msgs::msg::Image image_msg_;
   sensor_msgs::msg::CameraInfo camera_info_msg_;
+  bool publish_raw_ = false;
+  std::string image_encoding_ = "rgb8";
   image_transport::CameraPublisher camera_pub_;
   std::unique_ptr<camera_info_manager::CameraInfoManager> camera_info_manager_;
   rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr params_callback_handle_;
